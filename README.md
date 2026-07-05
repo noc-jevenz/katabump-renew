@@ -10,6 +10,8 @@
 - **自动重试**: 内置严格的验证重试机制，如果验证失败会自动重启验证流程。
 - **多用户支持**: 支持配置多个账号批量续期。
 - **Telegram 通知**: 续期结果（成功/失败/跳过）自动推送到 Telegram，附带截图。
+- **运行留存控制**: Actions artifact 和旧 workflow run 记录默认保留 14 天，减少手动清理。
+- **故障诊断**: Chrome 启动日志会随截图一起上传，便于排查 GitHub Actions 上的偶发启动问题。
 
 ---
 
@@ -35,15 +37,22 @@
    - `TG_CHAT_ID`: 你的 Chat ID (用户 ID 或群组 ID)。
    > 如果未配置，脚本将跳过发送通知。
 
-7. 保存后，进入 **Actions** 页面，启用 Workflow。它会在**每天北京时间 08:00 (UTC 00:00)** 自动运行。
-8. 你也可以手动点击 "Run workflow" 立即测试。
+7. **(可选) 指定 Chrome 路径**:
+   默认会自动查找 `google-chrome` / `chromium`。如果你的运行环境路径不同，可以配置 `CHROME_PATH` 环境变量。
+
+8. 保存后，进入 **Actions** 页面，启用 Workflow。它会在**每天北京时间 08:00 (UTC 00:00)** 自动运行。
+9. 你也可以手动点击 "Run workflow" 立即测试。
 
 ### 运行结果与截图
 
 - **运行日志**: 在 Actions 中的 `Run Renew Script` 步骤查看。
 - **截图留存**: 每次运行（无论成功与否），通过 `Upload Screenshots` 步骤自动上传截图。
   - 你可以在 Workflow 运行详情页的 **Artifacts** 区域下载 `screenshots` 压缩包。
-  - 每个账号对应一张截图（`username.png`），方便确认状态。
+  - 每个账号会保存最终状态截图（`username.png`），续期成功、失败、验证码等关键节点也会保存对应截图。
+  - `chrome_startup.log` 会包含 Chrome 启动输出；如果 Chrome 初始化失败，优先查看这个文件和 Actions 日志。
+  - 截图 artifact 默认保留 14 天。
+- **运行记录清理**: Workflow 会在每次运行结束后删除 14 天前已完成的旧 workflow run 记录。
+- **失败状态**: 如果任意账号登录、验证码或续期流程失败，脚本会以非零退出码结束，GitHub Actions 会显示失败；暂未到续期时间会按成功处理。
 
 ---
 

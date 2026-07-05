@@ -3,15 +3,24 @@ const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const http = require('http');
 
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
+const TELEGRAM_TIMEOUT_MS = 15000;
+const TELEGRAM_PARSE_MODE = 'HTML';
 
-// --- 辅助函数：转义 Telegram Markdown v1 特殊字符 ---
-function escapeMarkdown(text) {
-    return text.replace(/([_*`\[])/g, '\\$1');
+// --- 辅助函数：转义 Telegram HTML 特殊字符 ---
+function escapeTelegramHtml(text) {
+    return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function formatTelegramUserMessage(icon, username, body) {
+    return `${icon} <b>${escapeTelegramHtml(username)}</b>\n${escapeTelegramHtml(body)}`;
 }
 
 // --- 辅助函数：发送 Telegram（图文合并为一条消息） ---
@@ -24,16 +33,21 @@ async function sendTelegramMessage(message, imagePath = null) {
             form.append('chat_id', TG_CHAT_ID);
             form.append('photo', fs.createReadStream(imagePath));
             form.append('caption', message);
-            form.append('parse_mode', 'Markdown');
+            form.append('parse_mode', TELEGRAM_PARSE_MODE);
             await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, form, {
-                headers: form.getHeaders()
+                headers: form.getHeaders(),
+                timeout: TELEGRAM_TIMEOUT_MS,
+                maxBodyLength: Infinity
             });
             console.log('[Telegram] Photo with caption sent.');
         } else {
             await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
                 chat_id: TG_CHAT_ID,
                 text: message,
-                parse_mode: 'Markdown'
+                parse_mode: TELEGRAM_PARSE_MODE
+            }, {
+                timeout: TELEGRAM_TIMEOUT_MS,
+                maxBodyLength: Infinity
             });
             console.log('[Telegram] Message sent.');
         }
@@ -44,11 +58,17 @@ async function sendTelegramMessage(message, imagePath = null) {
 
 chromium.use(stealth);
 
-const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+const CHROME_PATH = resolveChromePath();
 const DEBUG_PORT = 9222;
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
 const RENEW_MAX_ATTEMPTS = 3;
+const SCREENSHOT_SETTLE_MS = 1000;
+const SCREENSHOT_RETRY_ATTEMPTS = 3;
+const SCREENSHOT_MAX_VIEWPORT_HEIGHT = 2400;
+const CHROME_START_TIMEOUT_MS = 45000;
+const CHROME_START_RETRIES = 2;
+const CHROME_LOG_PATH = path.join(process.cwd(), 'screenshots', 'chrome_startup.log');
 process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
@@ -143,14 +163,88 @@ async function checkProxy() {
     }
 }
 
+function resolveChromePath() {
+    const configuredPath = process.env.CHROME_PATH;
+    if (configuredPath) return configuredPath;
+
+    const candidates = [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        'google-chrome',
+        'google-chrome-stable',
+        'chromium-browser',
+        'chromium'
+    ];
+
+    for (const candidate of candidates) {
+        if (path.isAbsolute(candidate)) {
+            if (fs.existsSync(candidate)) return candidate;
+            continue;
+        }
+
+        const result = spawnSync('which', [candidate], { encoding: 'utf8' });
+        if (result.status === 0 && result.stdout.trim()) {
+            return result.stdout.trim();
+        }
+    }
+
+    return '/usr/bin/google-chrome';
+}
+
+function createChromeUserDataDir() {
+    const safeRunId = String(process.env.GITHUB_RUN_ID || process.pid).replace(/[^a-z0-9_-]/gi, '_');
+    return path.join('/tmp', `katabump_chrome_${safeRunId}_${Date.now()}`);
+}
+
+function readLogTail(filePath, maxChars = 6000) {
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        return content.slice(-maxChars).trim();
+    } catch (e) {
+        return '';
+    }
+}
+
+function printChromeStartupLog() {
+    const tail = readLogTail(CHROME_LOG_PATH);
+    if (tail) {
+        console.error(`[Chrome] 启动日志尾部 (${CHROME_LOG_PATH}):\n${tail}`);
+    } else {
+        console.error(`[Chrome] 未读取到启动日志: ${CHROME_LOG_PATH}`);
+    }
+}
+
 function checkPort(port) {
     return new Promise((resolve) => {
+        let settled = false;
         const req = http.get(`http://localhost:${port}/json/version`, (res) => {
-            res.resume();
-            resolve(true);
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => {
+                body += chunk;
+                if (body.length > 10000) req.destroy();
+            });
+            res.on('end', () => {
+                if (settled) return;
+                settled = true;
+                try {
+                    const parsed = JSON.parse(body);
+                    resolve(Boolean(parsed.Browser || parsed.webSocketDebuggerUrl));
+                } catch (e) {
+                    resolve(false);
+                }
+            });
         });
-        req.on('error', () => resolve(false));
+        req.on('error', () => {
+            if (settled) return;
+            settled = true;
+            resolve(false);
+        });
         req.setTimeout(3000, () => {
+            if (settled) return;
+            settled = true;
             req.destroy();
             resolve(false);
         });
@@ -163,35 +257,83 @@ async function launchChrome() {
         console.log('Chrome 已开启。');
         return;
     }
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= CHROME_START_RETRIES; attempt++) {
+        try {
+            await startChromeProcess(attempt);
+            return;
+        } catch (e) {
+            lastError = e;
+            console.error(`[Chrome] 第 ${attempt}/${CHROME_START_RETRIES} 次启动失败: ${e.message}`);
+            printChromeStartupLog();
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    throw lastError || new Error('Chrome 启动失败');
+}
+
+async function startChromeProcess(attempt) {
+    const userDataDir = createChromeUserDataDir();
+    fs.mkdirSync(path.dirname(CHROME_LOG_PATH), { recursive: true });
+    fs.appendFileSync(CHROME_LOG_PATH, `\n\n=== Chrome launch attempt ${attempt} at ${new Date().toISOString()} ===\n`);
+
+    console.log(`正在启动 Chrome (路径: ${CHROME_PATH}, profile: ${userDataDir})...`);
     const args = [
         `--remote-debugging-port=${DEBUG_PORT}`,
+        '--remote-debugging-address=127.0.0.1',
         '--no-first-run',
         '--no-default-browser-check',
+        '--disable-background-networking',
         '--disable-gpu',
+        '--force-device-scale-factor=1',
+        '--disable-smooth-scrolling',
         `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data',
+        `--user-data-dir=${userDataDir}`,
         '--disable-dev-shm-usage'
     ];
     if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
         args.push('--proxy-bypass-list=<-loopback>');
     }
+
+    const logFd = fs.openSync(CHROME_LOG_PATH, 'a');
     const chrome = spawn(CHROME_PATH, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', logFd, logFd]
+    });
+    fs.closeSync(logFd);
+
+    let spawnError = null;
+    let exitDetails = null;
+    chrome.once('error', (err) => {
+        spawnError = err;
+    });
+    chrome.once('exit', (code, signal) => {
+        exitDetails = { code, signal };
     });
     chrome.unref();
+
     console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
-        if (await checkPort(DEBUG_PORT)) break;
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < CHROME_START_TIMEOUT_MS) {
+        if (spawnError) {
+            throw spawnError;
+        }
+        if (exitDetails) {
+            throw new Error(`Chrome 过早退出: code=${exitDetails.code}, signal=${exitDetails.signal}`);
+        }
+        if (await checkPort(DEBUG_PORT)) {
+            console.log(`Chrome 初始化完成，用时 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒。`);
+            return;
+        }
         await new Promise(r => setTimeout(r, 1000));
     }
-    if (!await checkPort(DEBUG_PORT)) {
-        throw new Error('Chrome 启动失败');
-    }
+
+    throw new Error(`Chrome 在 ${Math.ceil(CHROME_START_TIMEOUT_MS / 1000)} 秒内未开放调试端口`);
 }
 
 async function configurePageViewport(page) {
@@ -203,8 +345,179 @@ async function configurePageViewport(page) {
     }
 }
 
+async function waitForScreenshotReady(page) {
+    await page.bringToFront().catch(() => {});
+    await page.setViewportSize({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT }).catch(() => {});
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+    await page.evaluate(async () => {
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+        const withTimeout = (promise, ms) => Promise.race([promise, sleep(ms)]);
+
+        const styleId = '__screenshot_stabilizer__';
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.textContent = `
+                *, *::before, *::after {
+                    animation-duration: 0s !important;
+                    animation-delay: 0s !important;
+                    transition-duration: 0s !important;
+                    transition-delay: 0s !important;
+                    scroll-behavior: auto !important;
+                }
+                html, body {
+                    scroll-behavior: auto !important;
+                }
+            `;
+            document.documentElement.appendChild(style);
+        }
+
+        if (document.fonts && document.fonts.ready) {
+            await withTimeout(document.fonts.ready.catch(() => {}), 2000);
+        }
+
+        const pendingImages = Array.from(document.images || []).filter((image) => !image.complete);
+        if (pendingImages.length > 0) {
+            await withTimeout(Promise.all(pendingImages.map((image) => new Promise((resolve) => {
+                image.addEventListener('load', resolve, { once: true });
+                image.addEventListener('error', resolve, { once: true });
+            }))), 3000);
+        }
+
+        const body = document.body;
+        const html = document.documentElement;
+        const pageHeight = Math.max(
+            body ? body.scrollHeight : 0,
+            body ? body.offsetHeight : 0,
+            html ? html.clientHeight : 0,
+            html ? html.scrollHeight : 0,
+            html ? html.offsetHeight : 0
+        );
+        const step = Math.max(200, Math.floor(window.innerHeight * 0.8));
+        const maxY = Math.max(0, pageHeight - window.innerHeight);
+
+        for (let y = 0; y <= maxY; y += step) {
+            window.scrollTo(0, y);
+            await nextFrame();
+            await sleep(80);
+        }
+
+        window.scrollTo(0, 0);
+        await nextFrame();
+        await nextFrame();
+    }).catch(() => {});
+    await page.waitForTimeout(SCREENSHOT_SETTLE_MS);
+}
+
+async function getPageScreenshotMetrics(page) {
+    return await page.evaluate(() => {
+        const body = document.body;
+        const html = document.documentElement;
+        const scrollHeight = Math.ceil(Math.max(
+            body ? body.scrollHeight : 0,
+            body ? body.offsetHeight : 0,
+            html ? html.clientHeight : 0,
+            html ? html.scrollHeight : 0,
+            html ? html.offsetHeight : 0,
+            window.innerHeight || 0
+        ));
+        const scrollWidth = Math.ceil(Math.max(
+            body ? body.scrollWidth : 0,
+            body ? body.offsetWidth : 0,
+            html ? html.clientWidth : 0,
+            html ? html.scrollWidth : 0,
+            html ? html.offsetWidth : 0,
+            window.innerWidth || 0
+        ));
+
+        return {
+            scrollHeight,
+            scrollWidth,
+            viewportHeight: window.innerHeight || 0,
+            viewportWidth: window.innerWidth || 0
+        };
+    }).catch(() => ({
+        scrollHeight: VIEWPORT_HEIGHT,
+        scrollWidth: VIEWPORT_WIDTH,
+        viewportHeight: VIEWPORT_HEIGHT,
+        viewportWidth: VIEWPORT_WIDTH
+    }));
+}
+
+function readPngDimensions(imagePath) {
+    try {
+        const data = fs.readFileSync(imagePath);
+        const isPng = data.length >= 24 &&
+            data[0] === 0x89 &&
+            data[1] === 0x50 &&
+            data[2] === 0x4e &&
+            data[3] === 0x47;
+        if (!isPng) return null;
+
+        return {
+            width: data.readUInt32BE(16),
+            height: data.readUInt32BE(20)
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
 async function saveViewportScreenshot(page, imagePath) {
-    await page.screenshot({ path: imagePath, fullPage: true });
+    const dir = path.dirname(imagePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const originalViewport = page.viewportSize() || { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT };
+    let lastError = null;
+    for (let attempt = 1; attempt <= SCREENSHOT_RETRY_ATTEMPTS; attempt++) {
+        try {
+            await waitForScreenshotReady(page);
+            const metrics = await getPageScreenshotMetrics(page);
+            const screenshotViewportHeight = Math.min(
+                Math.max(metrics.scrollHeight, VIEWPORT_HEIGHT),
+                SCREENSHOT_MAX_VIEWPORT_HEIGHT
+            );
+
+            await page.setViewportSize({
+                width: VIEWPORT_WIDTH,
+                height: screenshotViewportHeight
+            }).catch(() => {});
+            await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+            await page.waitForTimeout(300);
+
+            const resizedMetrics = await getPageScreenshotMetrics(page);
+            await page.screenshot({
+                path: imagePath,
+                fullPage: true,
+                animations: 'disabled',
+                caret: 'hide',
+                scale: 'css',
+                timeout: 30000
+            });
+
+            const pngDimensions = readPngDimensions(imagePath);
+            if (
+                pngDimensions &&
+                resizedMetrics.scrollHeight > resizedMetrics.viewportHeight + 20 &&
+                pngDimensions.height < resizedMetrics.scrollHeight - 20
+            ) {
+                throw new Error(`截图高度不足: image=${pngDimensions.height}, page=${resizedMetrics.scrollHeight}`);
+            }
+
+            return;
+        } catch (e) {
+            lastError = e;
+            console.log(`[截图] 第 ${attempt} 次截图失败: ${e.message}`);
+            await page.waitForTimeout(1000).catch(() => {});
+        } finally {
+            await page.setViewportSize(originalViewport).catch(() => {});
+            await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+        }
+    }
+
+    throw lastError;
 }
 
 function maskUsernameForLog(username) {
@@ -221,6 +534,13 @@ function maskUsernameForLog(username) {
     const domain = value.slice(atIndex + 1);
     const maskedName = name.length <= 2 ? `${name[0] || '*'}*` : `${name.slice(0, 2)}***`;
     return `${maskedName}@${domain}`;
+}
+
+function recordUserFailure(failedUsers, user, reason) {
+    const username = user && user.username ? user.username : '';
+    const maskedUsername = maskUsernameForLog(username);
+    failedUsers.push({ username: maskedUsername, reason });
+    console.error(`[结果] ${maskedUsername} 失败: ${reason}`);
 }
 
 function getUsers() {
@@ -418,6 +738,8 @@ async function getAltchaStatus(page) {
             const ariaChecked = normalize(checkbox ? checkbox.getAttribute('aria-checked') : '');
             const busyAttr = normalize(widget ? widget.getAttribute('aria-busy') : '');
             const state = stateProp || stateAttr || '';
+            const widgetExists = !!widget;
+            const tokenInputExists = altchaInputs.length > 0;
             const isSolved = state === 'verified' || valueProp.length > 0 || valueAttr.length > 0 || hiddenInputValue.length > 0;
             const isVerifying = !isSolved && (
                 state === 'verifying' ||
@@ -429,13 +751,15 @@ async function getAltchaStatus(page) {
             );
 
             return {
-                exists: !!widget || altchaInputs.length > 0,
+                widgetExists,
+                tokenInputExists,
                 solved: isSolved,
                 isVerifying,
                 state: state || 'unknown',
                 hasShadowRoot: !!shadowRoot,
                 checkboxChecked,
                 ariaChecked,
+                relatedInputCount: altchaInputs.length,
                 valueLength: Math.max(valueProp.length, valueAttr.length),
                 hiddenInputLength: hiddenInputValue.length,
                 busy: busyAttr === 'true'
@@ -443,13 +767,15 @@ async function getAltchaStatus(page) {
         });
     } catch (e) {
         return {
-            exists: false,
+            widgetExists: false,
+            tokenInputExists: false,
             solved: false,
             isVerifying: false,
             state: 'error',
             hasShadowRoot: false,
             checkboxChecked: null,
             ariaChecked: '',
+            relatedInputCount: 0,
             valueLength: 0,
             hiddenInputLength: 0,
             busy: false
@@ -460,7 +786,7 @@ async function getAltchaStatus(page) {
 function formatAltchaStatus(status) {
     const checkedText = status.checkboxChecked === null ? 'unknown' : String(status.checkboxChecked);
     const ariaChecked = status.ariaChecked || 'n/a';
-    return `state=${status.state}, solved=${status.solved}, verifying=${status.isVerifying}, shadow=${status.hasShadowRoot}, checked=${checkedText}, ariaChecked=${ariaChecked}, valueLen=${status.valueLength}, hiddenLen=${status.hiddenInputLength}, busy=${status.busy}`;
+    return `widget=${status.widgetExists}, tokenInput=${status.tokenInputExists}, inputs=${status.relatedInputCount}, state=${status.state}, solved=${status.solved}, verifying=${status.isVerifying}, shadow=${status.hasShadowRoot}, checked=${checkedText}, ariaChecked=${ariaChecked}, valueLen=${status.valueLength}, hiddenLen=${status.hiddenInputLength}, busy=${status.busy}`;
 }
 
 async function checkAltchaSuccess(page) {
@@ -545,21 +871,68 @@ async function attemptAltchaClick(page, currentStatus = null) {
     return false;
 }
 
-async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts = 15, waitAfterClick = 8000) {
+async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts = 10, waitAfterClick = 8000) {
     console.log(`[${stageName}] 开始检测 ALTCHA Captcha...`);
-    let sawAltcha = false;
+    let sawWidget = false;
+    let sawRelatedField = false;
+    let lastStatusText = '';
+
+    // 先给 widget 一个短暂挂载窗口。只有真实 widget 出现，才进入后续长时间验证流程。
+    const widgetAppearTimeout = 5000;
+    const widgetAppearStartedAt = Date.now();
+
+    while (Date.now() - widgetAppearStartedAt < widgetAppearTimeout) {
+        const precheckStatus = await getAltchaStatus(page);
+        sawRelatedField = sawRelatedField || precheckStatus.tokenInputExists;
+
+        const precheckText = formatAltchaStatus(precheckStatus);
+        if ((precheckStatus.widgetExists || precheckStatus.tokenInputExists) && precheckText !== lastStatusText) {
+            console.log(`[${stageName}] ALTCHA 状态: ${precheckText}`);
+            lastStatusText = precheckText;
+        }
+
+        if (precheckStatus.solved) {
+            console.log(`[${stageName}] ✅ ALTCHA 已通过验证。`);
+            return true;
+        }
+
+        if (precheckStatus.widgetExists) {
+            sawWidget = true;
+            break;
+        }
+
+        await page.waitForTimeout(500);
+    }
+
+    if (!sawWidget) {
+        const finalPrecheckStatus = await getAltchaStatus(page);
+        sawRelatedField = sawRelatedField || finalPrecheckStatus.tokenInputExists;
+
+        if (finalPrecheckStatus.solved) {
+            console.log(`[${stageName}] ✅ ALTCHA 已通过验证。`);
+            return true;
+        }
+
+        if (!finalPrecheckStatus.widgetExists) {
+            const relatedHint = sawRelatedField ? '（仅检测到 ALTCHA 相关字段，未发现可交互 widget）' : '';
+            console.log(`[${stageName}] ${widgetAppearTimeout}ms 内未检测到 ALTCHA widget，按无验证码处理${relatedHint}。`);
+            return true;
+        }
+
+        sawWidget = true;
+    }
 
     const startedAt = Date.now();
     const totalWaitBudget = Math.max(waitAfterClick * maxAttempts, waitAfterClick);
     let clickAttempts = 0;
-    let lastStatusText = '';
 
     while (Date.now() - startedAt < totalWaitBudget) {
         const status = await getAltchaStatus(page);
-        if (status.exists) sawAltcha = true;
+        if (status.widgetExists) sawWidget = true;
+        sawRelatedField = sawRelatedField || status.tokenInputExists;
 
         const statusText = formatAltchaStatus(status);
-        if (status.exists && statusText !== lastStatusText) {
+        if ((status.widgetExists || status.tokenInputExists) && statusText !== lastStatusText) {
             console.log(`[${stageName}] ALTCHA 状态: ${statusText}`);
             lastStatusText = statusText;
         }
@@ -569,7 +942,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             return true;
         }
 
-        if (!status.exists) {
+        if (!status.widgetExists) {
             await page.waitForTimeout(1000);
             continue;
         }
@@ -595,16 +968,16 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         console.log(`[${stageName}] 已点击 ALTCHA，等待 PoW 哈希计算完成 (${waitAfterClick}ms)，当前点击 ${clickAttempts}/${maxAttempts}...`);
 
         const clickStartedAt = Date.now();
-        let observedVerification = false;
 
         while (Date.now() - clickStartedAt < waitAfterClick) {
             await page.waitForTimeout(1000);
 
             const followupStatus = await getAltchaStatus(page);
-            if (followupStatus.exists) sawAltcha = true;
+            if (followupStatus.widgetExists) sawWidget = true;
+            sawRelatedField = sawRelatedField || followupStatus.tokenInputExists;
 
             const followupText = formatAltchaStatus(followupStatus);
-            if (followupStatus.exists && followupText !== lastStatusText) {
+            if ((followupStatus.widgetExists || followupStatus.tokenInputExists) && followupText !== lastStatusText) {
                 console.log(`[${stageName}] ALTCHA 状态: ${followupText}`);
                 lastStatusText = followupText;
             }
@@ -615,24 +988,36 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             }
 
             if (followupStatus.isVerifying) {
-                observedVerification = true;
                 continue;
             }
+        }
 
-            if (!observedVerification && Date.now() - clickStartedAt >= 2500) {
-                console.log(`[${stageName}] ⚠️ 点击后未观察到 ALTCHA 进入 verifying 状态，准备重新尝试点击...`);
-                break;
-            }
+        const postWaitStatus = await getAltchaStatus(page);
+        const postWaitText = formatAltchaStatus(postWaitStatus);
+        if ((postWaitStatus.widgetExists || postWaitStatus.tokenInputExists) && postWaitText !== lastStatusText) {
+            console.log(`[${stageName}] ALTCHA 状态: ${postWaitText}`);
+            lastStatusText = postWaitText;
+        }
+
+        if (postWaitStatus.solved) {
+            console.log(`[${stageName}] ✅ ALTCHA 验证通过 (PoW 计算完成)！`);
+            return true;
+        }
+
+        if (postWaitStatus.isVerifying) {
+            console.log(`[${stageName}] ALTCHA 仍在 verifying，继续等待验证结果...`);
+        } else {
+            console.log(`[${stageName}] 等待 ${waitAfterClick}ms 后仍未检测到 token/solved/verifying，准备下一次点击...`);
         }
     }
 
-    if (!sawAltcha) {
-        console.log(`[${stageName}] 弹窗中未检测到 ALTCHA 组件。`);
+    if (!sawWidget) {
+        console.log(`[${stageName}] 弹窗中未检测到 ALTCHA widget。`);
         return true;
     }
 
     const finalStatus = await getAltchaStatus(page);
-    console.log(`[${stageName}] 检测到 ALTCHA，但在 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒内未能通过验证。最终状态: ${formatAltchaStatus(finalStatus)}`);
+    console.log(`[${stageName}] 检测到 ALTCHA widget，但在 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒内未能通过验证。最终状态: ${formatAltchaStatus(finalStatus)}`);
     return false;
 }
 
@@ -640,66 +1025,67 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 // =============== 主循环执行 =================
 // ==========================================
 (async () => {
-    const users = getUsers();
-    if (users.length === 0) {
-        console.log('未在 process.env.USERS_JSON 中找到用户');
-        process.exit(1);
-    }
+    let browser = null;
+    let exitCode = 0;
+    const failedUsers = [];
 
-    if (PROXY_CONFIG) {
-        if (!await checkProxy()) process.exit(1);
-    }
-
-    await launchChrome();
-
-    console.log(`正在连接 Chrome...`);
-    let browser;
-    for (let k = 0; k < 5; k++) {
-        try {
-            browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
-            console.log('连接成功！');
-            break;
-        } catch (e) {
-            console.log(`连接尝试 ${k + 1} 失败。2秒后重试...`);
-            await new Promise(r => setTimeout(r, 2000));
+    try {
+        const users = getUsers();
+        if (users.length === 0) {
+            throw new Error('未在 process.env.USERS_JSON 中找到用户');
         }
-    }
-    if (!browser) process.exit(1);
 
-    const context = browser.contexts()[0];
-    if (!context) {
-        console.error('无法获取浏览器上下文，退出。');
-        await browser.close();
-        process.exit(1);
-    }
-    let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
-    page.setDefaultTimeout(60000);
-    await configurePageViewport(page);
+        if (PROXY_CONFIG && !await checkProxy()) {
+            throw new Error('代理连接失败');
+        }
 
-    // --- 代理认证处理 ---
-    if (PROXY_CONFIG && PROXY_CONFIG.username) {
-        console.log('[代理] 设置认证拦截...');
-        await context.route('**/*', (route) => {
-            route.continue({
-                headers: {
-                    ...route.request().headers(),
-                    'Proxy-Authorization': 'Basic ' + Buffer.from(`${PROXY_CONFIG.username}:${PROXY_CONFIG.password}`).toString('base64')
-                }
-            });
-        });
-    }
+        await launchChrome();
 
-    await page.addInitScript(INJECTED_SCRIPT);
-
-    for (let i = 0; i < users.length; i++) {
-        const user = users[i];
-        console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
-
-        try {
-            if (page.isClosed()) {
-                page = await context.newPage();
-                await page.addInitScript(INJECTED_SCRIPT);
+        console.log(`正在连接 Chrome...`);
+        for (let k = 0; k < 5; k++) {
+            try {
+                browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+                console.log('连接成功！');
+                break;
+            } catch (e) {
+                console.log(`连接尝试 ${k + 1} 失败。2秒后重试...`);
+                await new Promise(r => setTimeout(r, 2000));
             }
+        }
+        if (!browser) throw new Error('无法连接 Chrome');
+
+        const context = browser.contexts()[0];
+        if (!context) {
+            throw new Error('无法获取浏览器上下文');
+        }
+        let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+        page.setDefaultTimeout(60000);
+        await configurePageViewport(page);
+
+        // --- 代理认证处理 ---
+        if (PROXY_CONFIG && PROXY_CONFIG.username) {
+            console.log('[代理] 设置认证拦截...');
+            await context.route('**/*', (route) => {
+                route.continue({
+                    headers: {
+                        ...route.request().headers(),
+                        'Proxy-Authorization': 'Basic ' + Buffer.from(`${PROXY_CONFIG.username}:${PROXY_CONFIG.password}`).toString('base64')
+                    }
+                });
+            });
+        }
+
+        await page.addInitScript(INJECTED_SCRIPT);
+
+        for (let i = 0; i < users.length; i++) {
+            const user = users[i];
+            console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
+
+            try {
+                if (page.isClosed()) {
+                    page = await context.newPage();
+                    await page.addInitScript(INJECTED_SCRIPT);
+                }
 
             // 1. 先确保已登出，再访问登录页
             console.log('确保已登出...');
@@ -722,7 +1108,18 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             await page.waitForTimeout(3000); 
 
             // ➡️ 【登录阶段专属】：解决 Turnstile
-            await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
+            const turnstileOk = await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
+            if (!turnstileOk) {
+                console.error('   >> ❌ 登录阶段 Turnstile 未通过，跳过当前用户。');
+                recordUserFailure(failedUsers, user, '登录阶段 Turnstile 未通过');
+                const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                const failScreenshot = path.join(failPhotoDir, `${failSafe}_turnstile_fail.png`);
+                try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+                await sendTelegramMessage(formatTelegramUserMessage('❌', user.username, '登录阶段 Turnstile 未通过'), failScreenshot);
+                continue;
+            }
 
             console.log('正在输入凭据...');
             try {
@@ -741,12 +1138,13 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
                         console.error(`   >> ❌ 登录失败: 账号或密码错误`);
+                        recordUserFailure(failedUsers, user, '登录失败: 账号或密码错误');
                         const failPhotoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
                         const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
                         const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
                         try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
-                        await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
+                        await sendTelegramMessage(formatTelegramUserMessage('❌', user.username, '登录失败: 账号或密码错误'), failScreenshot);
                         continue;
                     }
                 } catch (e) { }
@@ -763,6 +1161,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
                 console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
+                recordUserFailure(failedUsers, user, '未找到 See 链接，可能登录未成功或界面变动');
                 continue;
             }
 
@@ -813,7 +1212,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         }
                         
                         // ➡️ 【Renew阶段专属】：只处理 ALTCHA Captcha，给 8 秒等待它的 PoW 后台计算
-                        const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
+                        const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 10, 8000);
 
                         if (!altchaOk) {
                             renewFailureReason = `续期失败，Renew 阶段 ALTCHA 未通过（已重试 ${RENEW_MAX_ATTEMPTS} 次）`;
@@ -864,7 +1263,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                                     }
 
                                     try { await saveViewportScreenshot(page, skipScreenshot); } catch (e) {}
-                                    await sendTelegramMessage(`⏳ *${escapeMarkdown(user.username)}*\n暂无法续期，下次可续期时间: ${dateStr}`, skipScreenshot);
+                                    await sendTelegramMessage(formatTelegramUserMessage('⏳', user.username, `暂无法续期，下次可续期时间: ${dateStr}`), skipScreenshot);
                                     break;
                                 }
                                 await page.waitForTimeout(200);
@@ -890,7 +1289,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                             console.log('   >> ✅ Renew successful!');
                             const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
                             try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
-                            await sendTelegramMessage(`✅ *${escapeMarkdown(user.username)}*\n续期成功！`, successScreenshot);
+                            await sendTelegramMessage(formatTelegramUserMessage('✅', user.username, '续期成功！'), successScreenshot);
                             renewSuccess = true;
                             break;
                         } else {
@@ -920,15 +1319,17 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
             if (!renewSuccess) {
                 console.log('   >> ❌ Renew 全部尝试失败。');
+                recordUserFailure(failedUsers, user, renewFailureReason);
                 const failDir = path.join(process.cwd(), 'screenshots');
                 if (!fs.existsSync(failDir)) fs.mkdirSync(failDir, { recursive: true });
                 const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
                 const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
                 try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
-                await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n${renewFailureReason}`, failScreenshot);
+                await sendTelegramMessage(formatTelegramUserMessage('❌', user.username, renewFailureReason), failScreenshot);
             }
 
         } catch (err) {
+            recordUserFailure(failedUsers, user, `处理异常: ${err.message || err}`);
             console.error(`Error processing user:`, err);
         }
 
@@ -942,7 +1343,27 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         console.log(`用户处理完成\n`);
     }
 
-    console.log('完成。');
-    await browser.close();
-    process.exit(0);
+        if (failedUsers.length > 0) {
+            exitCode = 1;
+            console.error(`完成，但 ${failedUsers.length}/${users.length} 个用户处理失败。`);
+            for (const failedUser of failedUsers) {
+                console.error(` - ${failedUser.username}: ${failedUser.reason}`);
+            }
+        } else {
+            console.log('完成，所有用户处理成功。');
+        }
+    } catch (err) {
+        exitCode = 1;
+        console.error('脚本执行失败:', err);
+    } finally {
+        if (browser) {
+            try {
+                await browser.close();
+                console.log('浏览器已关闭。');
+            } catch (e) {
+                console.error('关闭浏览器失败:', e.message);
+            }
+        }
+        process.exit(exitCode);
+    }
 })();
